@@ -59,6 +59,15 @@ target_link_libraries(kvstore_core
 add_executable(kvstore src/main.cpp)
 target_link_libraries(kvstore PRIVATE kvstore_core kvstore_warnings kvstore_sanitizers)
 
+# The client shares no code with the server on purpose: it parses replies, which
+# the server never does, and it has no use for an event loop. Keeping it
+# standalone means the CLI binary does not carry the storage engine around.
+add_executable(kvstore-cli src/cli_main.cpp)
+target_link_libraries(kvstore-cli PRIVATE kvstore_warnings kvstore_sanitizers)
+
+include(GNUInstallDirs)
+install(TARGETS kvstore kvstore-cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
 enable_testing()
 
 add_executable(kvstore_tests tests/test_main.cpp)

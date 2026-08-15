@@ -108,7 +108,7 @@ class Wal {
   std::uint64_t bytes_written() const noexcept { return bytes_written_; }
 
  private:
-  void encode(const WalRecord& record, std::vector<char>& out) const;
+  void encode(const WalRecord& record, std::vector<char>& out);
 
   std::string path_;
   SyncPolicy policy_;
@@ -120,7 +120,10 @@ class Wal {
   mutable std::mutex mutex_;
 
   // Reused across appends so the steady-state write path does not allocate.
+  // scratch_ holds the assembled record; payload_ holds the part the header
+  // describes, which must be complete before the header can be written.
   std::vector<char> scratch_;
+  std::vector<char> payload_;
 
   std::uint64_t bytes_written_ = 0;
 };

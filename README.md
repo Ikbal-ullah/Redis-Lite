@@ -12,6 +12,23 @@ macOS.
                         └── N threads            └── write-ahead log ──> disk
 ```
 
+Ships with a terminal client, a dependency-free Python SDK, a benchmark suite,
+and a container image.
+
+## Quick start
+
+```bash
+docker compose up -d
+./build/kvstore-cli SET user:1 ikbal
+```
+
+Or build from source:
+
+```bash
+cmake -S . -B build && cmake --build build
+./build/kvstore --port 6379 --wal wal.log
+```
+
 ## Build
 
 ```bash
@@ -77,12 +94,81 @@ kill -9 %1                     # hard crash
 printf 'GET user:1\r\n' | nc -w 2 127.0.0.1 7391    # -> ikbal
 ```
 
+## Terminal client
+
+```bash
+./build/kvstore-cli                       # interactive prompt
+./build/kvstore-cli PING                  # one-shot, exits 0/1/2
+printf 'SET a 1\nGET a\n' | ./build/kvstore-cli
+```
+
+Colour-coded output, quoted arguments (`SET k "hello world"`), and exit codes
+suitable for scripting: `0` success, `1` error reply, `2` connection failure.
+Colour is suppressed automatically when stdout is not a terminal, and when
+`NO_COLOR` is set.
+
+## Python SDK
+
+Standard library only — no `pip install`.
+
+```python
+import sys; sys.path.insert(0, "sdk")
+from redis_lite import Client
+
+with Client(host="127.0.0.1", port=6379) as client:
+    client.set("user:1", "ikbal")
+    client.get("user:1")            # 'ikbal'
+    client.expire("user:1", 60)     # True
+    client.delete("user:1")         # 1
+    client.ping()                   # 'PONG'
+```
+
+Binary-safe values, dictionary sugar (`client["k"] = "v"`), pipelining, and
+typed exceptions (`CommandError`, `ConnectionError`, `ProtocolError`). A client
+owns one socket and is not thread-safe — use one per thread.
+
+## Benchmark
+
+```bash
+python3 scripts/benchmark.py --ops 10000 --threads 8
+```
+
+```
+Workload          Ops   Time (s)        Req/s   p50 (ms)   p99 (ms)   max (ms)   Errors
+---------------------------------------------------------------------------------------
+SET            10,000      0.393       25,438      0.286      0.787      2.049        0
+GET            10,000      0.382       26,157      0.278      0.777      2.386        0
+MIXED 1:1      10,000      0.386       25,894      0.276      0.810      2.537        0
+```
+
+That run is against a `--no-fsync` server. With the default per-write flush,
+SET drops to ~370 req/s while GET is essentially unchanged — the durability
+tax, and evidence that readers are not blocked by the disk. See `EXPLAINER.md`
+§6.3.
+
+## Docker
+
+```bash
+docker compose up -d          # build, start, publish 127.0.0.1:6379
+docker compose ps             # (healthy) once the PING check passes
+docker compose down           # stop, keeping the data volume
+docker compose down -v        # stop and delete the data
+```
+
+Multi-stage build: the compiler stage is discarded, leaving a ~136 MB runtime
+image that runs as a non-root user. The test suite runs during the image build,
+so a broken image fails to build. `wal.log` lives on a named volume, so data
+outlives the container.
+
 ## Build options
 
 | Option | Default | Effect |
 |---|---|---|
 | `KVSTORE_WERROR` | `OFF` | Treat warnings as errors |
 | `KVSTORE_SANITIZE` | `OFF` | Build with ASan + UBSan |
+
+The project is warning-free under `-Wall -Wextra -pedantic -Werror` on both
+Clang and GCC; the container build enables `KVSTORE_WERROR` to keep it that way.
 
 ## Layout
 
@@ -95,11 +181,16 @@ include/kvstore/
 src/
   main.cpp        argument parsing, startup, signal handling
   server.cpp      + command dispatch
+  cli_main.cpp    kvstore-cli, standalone terminal client
   protocol.cpp
   storage.cpp
   wal.cpp
+sdk/redis_lite.py       dependency-free Python client
+scripts/benchmark.py    throughput and latency harness
 tests/test_main.cpp
-EXPLAINER.md      architecture and the OS mechanics underneath it
+Dockerfile              multi-stage build
+docker-compose.yml      port binding and persistent volume
+EXPLAINER.md            architecture and the OS mechanics underneath it
 ```
 
 `EXPLAINER.md` is the long-form walkthrough: what a file descriptor and a TCP

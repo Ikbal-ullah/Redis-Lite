@@ -31,7 +31,13 @@ you can verify with a terminal.
    - [3.7 RAII — the destructors doing the cleanup you never wrote](#37-raii--the-destructors-doing-the-cleanup-you-never-wrote)
 4. [Crash recovery, step by step](#4-crash-recovery-step-by-step)
 5. [Hands-on verification: five tracing questions](#5-hands-on-verification-five-tracing-questions)
-6. [What this server does not do](#6-what-this-server-does-not-do)
+6. [Developer tooling and deployment](#6-developer-tooling-and-deployment)
+   - [6.1 The terminal client](#61-the-terminal-client)
+   - [6.2 The Python SDK](#62-the-python-sdk)
+   - [6.3 The benchmark suite](#63-the-benchmark-suite)
+   - [6.4 Docker](#64-docker)
+   - [6.5 Docker Compose](#65-docker-compose)
+7. [What this server does not do](#7-what-this-server-does-not-do)
 
 ---
 
@@ -1379,13 +1385,337 @@ outside.
 buffer without bound. A production server sets a maximum output-buffer size per
 client and closes any connection that exceeds it — Redis calls this the client
 output buffer limit. `kMaxInputBacklog` does this for the *input* side; the
-output side has no equivalent. See §6.
+output side has no equivalent. See §7.
 
 </details>
 
 ---
 
-## 6. What this server does not do
+## 6. Developer tooling and deployment
+
+Everything below is copy-pasteable. The numbers quoted are real measurements
+from an Apple M-series laptop, not estimates; yours will differ, and the
+*ratios* are the interesting part regardless.
+
+### 6.1 The terminal client
+
+`kvstore-cli` is built alongside the server and shares no code with it. It
+parses replies, which the server never has to do, and it has no use for an
+event loop.
+
+```bash
+cmake -S . -B build && cmake --build build
+./build/kvstore --port 6379 --wal wal.log &
+./build/kvstore-cli
+```
+
+```
+127.0.0.1:6379> SET user:1 ikbal
+OK
+127.0.0.1:6379> GET user:1
+"ikbal"
+127.0.0.1:6379> SET greeting "hello world"
+OK
+127.0.0.1:6379> GET greeting
+"hello world"
+127.0.0.1:6379> EXPIRE greeting 60
+(integer) 1
+127.0.0.1:6379> GET nothing
+(nil)
+127.0.0.1:6379> BOGUS
+(error) ERR unknown command 'BOGUS'
+127.0.0.1:6379> quit
+```
+
+Values are printed green, errors red, `(nil)` dimmed. Three behaviours worth
+knowing:
+
+**Quoted arguments.** The client tokenises the line honouring double quotes and
+backslash escapes, then sends a RESP array of bulk strings. `SET greeting
+"hello world"` is therefore two arguments, not three, and a value may contain
+spaces, `\n`, or `\r`.
+
+**Colour is conditional.** Escape sequences are emitted only when stdout is a
+terminal, and suppressed entirely if `NO_COLOR` is set or `TERM=dumb`. Piping
+into a file or another program yields clean text:
+
+```bash
+./build/kvstore-cli GET user:1 | cat        # -> "ikbal", no escape codes
+NO_COLOR=1 ./build/kvstore-cli PING         # -> PONG, uncoloured
+```
+
+**One-shot mode and exit codes.** Any arguments after the flags are executed as
+a single command, and the process exits:
+
+| Exit code | Meaning |
+|---|---|
+| `0` | The command succeeded |
+| `1` | The server returned an error reply |
+| `2` | Could not connect, or the connection dropped |
+
+```bash
+./build/kvstore-cli --host 127.0.0.1 --port 6379 PING     # -> PONG,  exit 0
+./build/kvstore-cli BOGUS                                 # -> error, exit 1
+./build/kvstore-cli --port 9999 PING                      # -> error, exit 2
+```
+
+That is what makes it usable from a shell script and as the container health
+check. It also reads commands from a pipe, without printing a prompt:
+
+```bash
+printf 'SET a 1\nGET a\nDEL a\n' | ./build/kvstore-cli
+```
+
+### 6.2 The Python SDK
+
+`sdk/redis_lite.py` is a single file with no dependencies beyond the standard
+library. Copy it next to your code, or add the directory to `sys.path`.
+
+```python
+import sys
+sys.path.insert(0, "sdk")
+from redis_lite import Client
+
+with Client(host="127.0.0.1", port=6379) as client:
+    client.set("user:1", "ikbal")
+    print(client.get("user:1"))        # 'ikbal'
+    print(client.get("missing"))       # None
+    print(client.expire("user:1", 60)) # True
+    print(client.delete("user:1"))     # 1
+    print(client.ping())               # 'PONG'
+```
+
+Run it directly for a smoke check against a live server:
+
+```bash
+python3 sdk/redis_lite.py 127.0.0.1 6379
+```
+
+**Errors are exceptions, not return codes.**
+
+```python
+from redis_lite import Client, CommandError, ConnectionError, ProtocolError
+
+try:
+    client.execute("BOGUS")
+except CommandError as exc:      # the server rejected the command
+    print(exc)                   # ERR unknown command 'BOGUS'
+except ConnectionError:          # socket refused, timed out, or dropped
+    ...
+except ProtocolError:            # the reply was not valid RESP
+    ...
+```
+
+`ConnectionError` here is `redis_lite.ConnectionError`, deliberately shadowing
+the builtin inside this module's namespace. The module never catches the
+builtin internally — it catches `OSError`, the builtin's base class — so the
+two cannot be confused.
+
+**Binary safety.** Commands go out as RESP arrays of bulk strings, so values
+may contain anything:
+
+```python
+client.set("k", "line1\r\nline2\x00with a nul")
+assert client.get("k") == "line1\r\nline2\x00with a nul"
+
+raw = Client(decode_responses=False)      # values come back as bytes
+raw.set(b"bin", b"\x01\x02\xff")
+assert raw.get(b"bin") == b"\x01\x02\xff"
+```
+
+**Dictionary sugar**, for the cases where it reads better:
+
+```python
+client["session:42"] = "active"
+print(client["session:42"])        # 'active'
+print("session:42" in client)      # True
+del client["session:42"]
+```
+
+**Pipelining**, when the round-trip is the bottleneck. `pipeline()` writes all
+the commands in one `sendall` and then reads the replies in order, so N
+commands cost one round-trip instead of N:
+
+```python
+commands = [("SET", f"k{i}", i) for i in range(1000)]
+results = list(client.pipeline(commands))     # 1000 replies, 1 round-trip
+```
+
+**A `Client` owns one socket and is not thread-safe.** Give each thread its own
+instance. Sharing one interleaves bytes from different commands on the same
+socket and desynchronises the reply stream — the failure is silent and looks
+like data corruption. This is why the benchmark constructs a client per worker.
+
+### 6.3 The benchmark suite
+
+```bash
+./build/kvstore --port 6379 --wal wal.log &
+python3 scripts/benchmark.py                        # 10,000 ops, 8 threads
+python3 scripts/benchmark.py --ops 50000 --threads 16 --value-size 4096
+python3 scripts/benchmark.py --help
+```
+
+Output:
+
+```
+kvstore benchmark
+  target      127.0.0.1:6379
+  operations  10,000 per workload
+  threads     8 (one connection each)
+  value size  64 bytes
+
+Workload          Ops   Time (s)        Req/s   p50 (ms)   p99 (ms)   max (ms)   Errors
+---------------------------------------------------------------------------------------
+SET            10,000      0.393       25,438      0.286      0.787      2.049        0
+GET            10,000      0.382       26,157      0.278      0.777      2.386        0
+MIXED 1:1      10,000      0.386       25,894      0.276      0.810      2.537        0
+
+Summary
+  Total operations   30,000
+  Total time         1.162 s
+  Requests/second    25,826
+  p50 latency        0.280 ms
+  p99 latency        0.790 ms
+  Mean latency       0.307 ms
+```
+
+Each worker gets its own connection and they all wait on a `threading.Barrier`,
+so connection setup is excluded from the timing and the load genuinely starts at
+once. Percentiles use the **nearest-rank** method rather than interpolation: for
+latency you want a number some request actually experienced, not the average of
+two that straddle the rank.
+
+**The measurement that matters most.** The run above is against a server started
+with `--no-fsync`. Here is the same benchmark against the default, which flushes
+every write to the physical device before acknowledging it:
+
+| | SET req/s | SET p50 | GET req/s |
+|---|---|---|---|
+| `--no-fsync` | 25,438 | 0.286 ms | 26,157 |
+| default (`F_FULLFSYNC` per write) | **370** | **23.9 ms** | 16,905 |
+
+Writes are **69× slower**. That is not a defect; it is the cost of the
+guarantee, and §2.4 explains where the milliseconds go. Two things are worth
+drawing out:
+
+- **Reads barely move.** They are not blocked by the flush, which is the whole
+  point of holding `wal_mutex_` (not the map lock) across the `fsync` — see
+  §2.5. If reads had collapsed alongside writes, the two-lock design would be
+  buying nothing.
+- **This is the durability dial.** `--no-fsync` still survives a process crash,
+  because the kernel page cache outlives the process. It does not survive a
+  power cut. Choose per deployment; do not assume.
+
+**Read the numbers honestly.** This measures end-to-end latency *as a Python
+client experiences it* — encoding, round-trip, server work, and reply parsing.
+It is not server-side service time and it is not comparable to
+`redis-benchmark`, which is C and drives far more load per core. Past a handful
+of threads the GIL serialises the Python half and you are measuring the
+interpreter, not the server.
+
+### 6.4 Docker
+
+A two-stage build. The first stage carries a compiler, CMake, and headers —
+several hundred megabytes of toolchain that nothing at runtime needs. Only the
+two binaries cross into the second stage.
+
+```bash
+docker build -t kvstore:latest .
+docker run -d --name kvstore -p 127.0.0.1:6379:6379 -v kvstore-data:/data kvstore:latest
+docker logs kvstore
+docker exec kvstore kvstore-cli PING
+```
+
+```
+recovered 0 log record(s), 0 live key(s) from /data/wal.log
+listening on 0.0.0.0:6379 with 4 I/O thread(s)
+```
+
+Five decisions in the Dockerfile worth naming:
+
+**The test suite runs during the build.** `ctest` sits in the same `RUN` as the
+compile, so an image that cannot pass its own tests fails to build rather than
+reaching a registry.
+
+**`-DKVSTORE_WERROR=ON` in the image build.** The container compiles with GCC
+while local development here used Clang, and the two disagree about which
+warnings exist. Building the image is how the project stays honest about being
+warning-free on more than one compiler.
+
+**It binds `0.0.0.0`, not `127.0.0.1`.** Inside a container, loopback means
+"this container only" and the published port would reach nothing. The container's
+network namespace *is* the boundary — so keep the host-side publish narrow
+(`-p 127.0.0.1:6379:6379`), which is what the compose file does.
+
+**It runs as a non-root user.** `useradd --system kvstore`, and `/data` is
+chowned to it. A remote code execution bug then lands in an unprivileged
+account rather than owning the container filesystem. Verify:
+
+```bash
+docker exec kvstore id      # uid=999(kvstore) gid=999(kvstore)
+```
+
+**`ENTRYPOINT` is exec form.** The server becomes PID 1 and receives `SIGTERM`
+from `docker stop` directly, so it shuts down through its own handler instead of
+being `SIGKILL`ed after the grace period. A clean stop takes well under a
+second and exits 0:
+
+```bash
+docker stop kvstore                                        # ~0.3s
+docker inspect --format '{{.State.ExitCode}}' kvstore      # 0
+```
+
+If that command instead takes the full ten seconds, the signal handling is
+broken — that is the test for it.
+
+### 6.5 Docker Compose
+
+```bash
+docker compose up -d          # build and start
+docker compose ps             # STATUS shows (healthy) once the check passes
+docker compose logs -f
+docker compose down           # stop, keeping the volume
+docker compose down -v        # stop and delete the data
+```
+
+The service publishes `127.0.0.1:6379:6379`. The `127.0.0.1` prefix is load
+bearing: plain `6379:6379` binds `0.0.0.0` on the host, which puts an
+unauthenticated data store on the network and, on many setups, straight through
+the firewall. This server has no authentication and no TLS (§7).
+
+`wal.log` lives on the named volume `kvstore-data`, mounted at `/data`. That is
+what makes the data outlive the container rather than the other way round:
+
+```bash
+docker compose up -d
+./build/kvstore-cli SET durable "survives"
+docker compose down                    # container destroyed
+docker compose up -d                   # brand new container, same volume
+./build/kvstore-cli GET durable        # -> "survives"
+```
+
+The log line on the second start tells you recovery ran:
+
+```
+recovered 1 log record(s), 1 live key(s) from /data/wal.log
+```
+
+The health check shells out to `kvstore-cli PING`, which is exactly why the CLI
+returns a meaningful exit code. Compose marks the service healthy only once that
+succeeds, so `depends_on: condition: service_healthy` in a larger stack will
+actually wait for the store to finish replaying its log rather than racing it.
+
+**One caveat about durability inside Docker Desktop on macOS or Windows.** The
+container runs in a Linux VM, so the server uses `fsync()` and the "device" it
+flushes to is a virtual disk file on the host. A flush that returns successfully
+inside the VM does not necessarily mean the bytes reached the host's physical
+medium. The benchmark shows this plainly — SET runs several times faster in the
+container than natively, because native macOS pays for a real `F_FULLFSYNC`. For
+genuine power-cut durability, run on Linux with real storage.
+
+---
+
+## 7. What this server does not do
 
 Every one of these is a deliberate omission, not an oversight.
 

@@ -109,6 +109,25 @@ namespace {
 
 using namespace kvstore;
 
+// Builds "prefix" + number without going through
+// operator+(const char*, std::string&&), which appends in place and which GCC's
+// -Wrestrict analysis cannot prove non-overlapping once inlined. Appending
+// piecewise is both diagnosable and one allocation cheaper.
+std::string concat(std::string_view prefix, long long value) {
+  std::string out(prefix);
+  out += std::to_string(value);
+  return out;
+}
+
+std::string concat(std::string_view prefix, long long first, std::string_view middle,
+                   long long second) {
+  std::string out(prefix);
+  out += std::to_string(first);
+  out += middle;
+  out += std::to_string(second);
+  return out;
+}
+
 // A log file that deletes itself when the test scope ends, however the scope is
 // left. Test fixtures leak more often than production code, because a failing
 // assertion takes an early exit that a hand-written cleanup call never sees.
@@ -116,8 +135,8 @@ class TempLog {
  public:
   TempLog() {
     static std::atomic<int> counter{0};
-    auto name = "kvstore-test-" + std::to_string(::getpid()) + "-" +
-                std::to_string(counter.fetch_add(1)) + ".log";
+    std::string name = concat("kvstore-test-", ::getpid(), "-", counter.fetch_add(1));
+    name += ".log";
     path_ = std::filesystem::temp_directory_path() / name;
     std::error_code ignored;
     std::filesystem::remove(path_, ignored);
@@ -200,6 +219,34 @@ std::string recv_exact(int fd, std::size_t count) {
     CHECK(n > 0);
     out.append(chunk, static_cast<std::size_t>(n));
   }
+  return out;
+}
+
+// Builds a RESP array of bulk strings. Hand-writing the wire format inline is
+// fine for a fixed literal, but not for arguments whose lengths vary.
+std::string resp_array(std::initializer_list<std::string_view> args) {
+  std::string out;
+  out += '*';
+  out += std::to_string(args.size());
+  out += "\r\n";
+  for (const std::string_view arg : args) {
+    out += '$';
+    out += std::to_string(arg.size());
+    out += "\r\n";
+    out += arg;
+    out += "\r\n";
+  }
+  return out;
+}
+
+// The bulk-string reply the server sends back for a successful GET.
+std::string resp_bulk(std::string_view value) {
+  std::string out;
+  out += '$';
+  out += std::to_string(value.size());
+  out += "\r\n";
+  out += value;
+  out += "\r\n";
   return out;
 }
 
@@ -515,7 +562,7 @@ TEST(concurrent_readers_and_writers_keep_the_store_consistent) {
 
   // Seed every key so readers always have something to find.
   for (int w = 0; w < kWriters; ++w) {
-    storage.set("key" + std::to_string(w), "0");
+    storage.set(concat("key", w), "0");
   }
 
   std::atomic<bool> stop_readers{false};
@@ -524,7 +571,7 @@ TEST(concurrent_readers_and_writers_keep_the_store_consistent) {
 
   for (int w = 0; w < kWriters; ++w) {
     threads.emplace_back([&storage, w] {
-      const std::string key = "key" + std::to_string(w);
+      const std::string key = concat("key", w);
       for (int i = 1; i <= kIterations; ++i) {
         storage.set(key, std::to_string(i));
       }
@@ -533,7 +580,7 @@ TEST(concurrent_readers_and_writers_keep_the_store_consistent) {
 
   for (int r = 0; r < kReaders; ++r) {
     threads.emplace_back([&storage, &stop_readers, &reads, r] {
-      const std::string key = "key" + std::to_string(r % kWriters);
+      const std::string key = concat("key", r % kWriters);
       while (!stop_readers.load(std::memory_order_relaxed)) {
         const auto value = storage.get(key);
         // Every observed value must be one a writer actually wrote -- never a
@@ -553,7 +600,7 @@ TEST(concurrent_readers_and_writers_keep_the_store_consistent) {
 
   CHECK(reads.load() > 0);
   for (int w = 0; w < kWriters; ++w) {
-    CHECK_EQ(storage.get("key" + std::to_string(w)).value(),
+    CHECK_EQ(storage.get(concat("key", w)).value(),
              std::to_string(kIterations));
   }
 }
@@ -577,7 +624,7 @@ TEST(log_order_matches_memory_order_under_contention) {
     for (int t = 0; t < 6; ++t) {
       threads.emplace_back([&storage, t] {
         for (int i = 0; i < 500; ++i) {
-          storage.set("contended", "t" + std::to_string(t) + "-" + std::to_string(i));
+          storage.set("contended", concat("t", t, "-", i));
         }
       });
     }
@@ -704,19 +751,14 @@ TEST(many_clients_are_served_at_once) {
       try {
         const int fd = dial(server.port());
         for (int i = 0; i < kOpsPerClient; ++i) {
-          const std::string key = "c" + std::to_string(c) + "k" + std::to_string(i);
+          const std::string key = concat("c", c, "k", i);
           const std::string value = std::to_string(c * 1000 + i);
 
-          std::string request = "*3\r\n$3\r\nSET\r\n$" + std::to_string(key.size()) + "\r\n" +
-                                key + "\r\n$" + std::to_string(value.size()) + "\r\n" + value +
-                                "\r\n";
-          send_all(fd, request);
+          send_all(fd, resp_array({"SET", key, value}));
           if (recv_exact(fd, 5) != "+OK\r\n") failures.fetch_add(1);
 
-          request = "*2\r\n$3\r\nGET\r\n$" + std::to_string(key.size()) + "\r\n" + key + "\r\n";
-          send_all(fd, request);
-          const std::string expected =
-              "$" + std::to_string(value.size()) + "\r\n" + value + "\r\n";
+          send_all(fd, resp_array({"GET", key}));
+          const std::string expected = resp_bulk(value);
           if (recv_exact(fd, expected.size()) != expected) failures.fetch_add(1);
         }
         ::close(fd);

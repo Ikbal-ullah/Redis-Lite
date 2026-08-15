@@ -149,34 +149,33 @@ void Wal::close() {
   }
 }
 
-void Wal::encode(const WalRecord& record, std::vector<char>& out) const {
-  out.clear();
-  // Reserve the header, fill the payload, then patch the header in place --
-  // the length and CRC are not known until the payload exists.
-  out.resize(kHeaderSize, '\0');
-
-  out.push_back(static_cast<char>(record.op));
-  put_bytes(out, record.key);
+void Wal::encode(const WalRecord& record, std::vector<char>& out) {
+  // The payload is built first, in its own buffer, because neither header
+  // field can be computed until it exists: the length is its size and the CRC
+  // covers its bytes. Both buffers are reused across calls, so the steady-state
+  // write path performs no allocation.
+  payload_.clear();
+  payload_.push_back(static_cast<char>(record.op));
+  put_bytes(payload_, record.key);
   switch (record.op) {
     case WalOp::kSet:
-      put_bytes(out, record.value);
-      put_i64(out, record.expire_at_ms);
+      put_bytes(payload_, record.value);
+      put_i64(payload_, record.expire_at_ms);
       break;
     case WalOp::kExpire:
-      put_i64(out, record.expire_at_ms);
+      put_i64(payload_, record.expire_at_ms);
       break;
     case WalOp::kDel:
       break;
   }
 
-  const std::size_t payload_length = out.size() - kHeaderSize;
-  const std::uint32_t crc = crc32(out.data() + kHeaderSize, payload_length);
-
-  std::vector<char> header;
-  header.reserve(kHeaderSize);
-  put_u32(header, static_cast<std::uint32_t>(payload_length));
-  put_u32(header, crc);
-  std::copy(header.begin(), header.end(), out.begin());
+  // Header, then payload, assembled into one buffer so the whole record leaves
+  // in a single write() -- a record split across two writes could be torn in
+  // the middle by a crash even though each half succeeded.
+  out.clear();
+  put_u32(out, static_cast<std::uint32_t>(payload_.size()));
+  put_u32(out, crc32(payload_.data(), payload_.size()));
+  out.insert(out.end(), payload_.begin(), payload_.end());
 }
 
 void Wal::append(const WalRecord& record) {

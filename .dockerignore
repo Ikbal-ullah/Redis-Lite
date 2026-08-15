@@ -1,0 +1,33 @@
+# Keep the build context small and the layer cache stable. Anything not read by
+# the Dockerfile belongs here.
+
+.git
+.gitignore
+.dockerignore
+
+# Host build trees would be copied in and then shadowed by the container build,
+# wasting context upload time and risking stale CMake caches with absolute host
+# paths baked in.
+build/
+build-*/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+
+# Not read by the build
+Dockerfile
+docker-compose.yml
+README.md
+EXPLAINER.md
+sdk/
+scripts/
+
+# Runtime state and local noise
+*.log
+data/
+.vscode/
+.idea/
+.cache/
+.DS_Store
+__pycache__/
+*.pyc

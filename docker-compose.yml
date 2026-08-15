@@ -1,0 +1,56 @@
+services:
+  kvstore:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kvstore:latest
+    container_name: kvstore
+
+    # Published on the loopback interface only. Plain "6379:6379" would bind
+    # 0.0.0.0 on the host and expose an unauthenticated data store to the
+    # network -- and on many setups it also punches straight through the
+    # firewall. Drop the 127.0.0.1 prefix only when you have put
+    # authentication and TLS in front of it.
+    ports:
+      - "127.0.0.1:6379:6379"
+
+    # Named volume holding wal.log. This is what makes the data survive
+    # `docker compose down` and image rebuilds. For a log you can inspect
+    # directly from the host, swap in a bind mount: ./data:/data
+    volumes:
+      - kvstore-data:/data
+
+    command:
+      - "--bind"
+      - "0.0.0.0"
+      - "--port"
+      - "6379"
+      - "--wal"
+      - "/data/wal.log"
+      - "--threads"
+      - "4"
+
+    restart: unless-stopped
+
+    # The server flushes each write before acknowledging it, so a stop is never
+    # data-loss. The grace period is here so in-flight requests finish rather
+    # than seeing a reset connection.
+    stop_grace_period: 10s
+
+    healthcheck:
+      test: ["CMD", "kvstore-cli", "--host", "127.0.0.1", "--port", "6379", "PING"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+    ulimits:
+      # One descriptor per connection, plus the log and the wakeup pipes. The
+      # default of 1024 caps concurrent clients well below what the server can
+      # actually handle.
+      nofile:
+        soft: 65535
+        hard: 65535
+
+volumes:
+  kvstore-data:
