@@ -204,7 +204,9 @@ TEST(no_descriptor_leaks_across_connection_churn) {
   while (open_fd_count() > baseline && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
-  CHECK_EQ(open_fd_count(), baseline);
+  // <=, not ==: the warm-up socket may not have been reaped yet when the
+  // baseline was sampled. A leak shows up as a count *above* the baseline.
+  CHECK(open_fd_count() <= baseline);
   srv.stop();
   CHECK_EQ(srv.server().open_connections(), 0u);
 }
