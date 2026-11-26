@@ -1,205 +1,118 @@
-# kvstore
+# Redis-Lite
 
-A durable key-value store in C++20: a non-blocking TCP server speaking a subset
-of RESP, backed by a thread-safe hash map and an append-only write-ahead log.
+A Redis-compatible key-value server in C++20. It runs a single-threaded
+non-blocking `poll(2)` event loop, speaks RESP2 with pipelining, and persists
+to a CRC-framed write-ahead log with three durability modes. Group commit,
+atomic compaction, and recovery that tells a torn tail apart from mid-file
+corruption.
 
-No third-party dependencies. Builds with CMake and a C++20 compiler on Linux or
-macOS.
+It works unmodified with `redis-cli`, `redis-py` and `redis-benchmark`, and has
+no third-party C++ dependencies.
 
 ```
-  clients ──TCP──> event loops (poll) ──> hash map + shared_mutex
-                        │                        │
-                        └── N threads            └── write-ahead log ──> disk
+clients ─TCP─► poll() loop ─► RESP2 parser ─► Database ─► WAL ─► fsync
+                   ▲                              │
+                   └── replies (held until the ───┘
+                       covering fsync in group mode)
 ```
 
-Ships with a terminal client, a dependency-free Python SDK, a benchmark suite,
-and a container image.
+See [OWNERSHIP_DRILL.md](OWNERSHIP_DRILL.md) for the detailed architecture,
+[AUDIT_REPORT.md](AUDIT_REPORT.md) for what was wrong with the previous
+version, and [BENCHMARKS.md](BENCHMARKS.md) for raw measurements.
 
-## Quick start
+## Build, test, run
 
 ```bash
-docker compose up -d
-./build/kvstore-cli SET user:1 ikbal
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
+./build/kvstore --port 6379 --wal wal.log --fsync group
+redis-cli -p 6379 SET user:1 alice EX 60
 ```
 
-Or build from source:
+Tests (warnings are errors by default; sanitizers on):
 
 ```bash
-cmake -S . -B build && cmake --build build
-./build/kvstore --port 6379 --wal wal.log
-```
-
-## Build
-
-```bash
-cmake -S . -B build && cmake --build build
-```
-
-## Test
-
-```bash
-ctest --test-dir build --output-on-failure
-```
-
-27 cases covering protocol framing, storage semantics, log durability across
-simulated crashes, concurrent access, and end-to-end behaviour over real
-sockets.
-
-## Run
-
-```bash
-./build/kvstore --port 6379 --wal wal.log
+cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DKVSTORE_SANITIZE=ON
+cmake --build build-asan && ctest --test-dir build-asan --output-on-failure
+KVSTORE_BIN=build-asan/kvstore .venv/bin/pytest -q tests/test_redis_py.py
+KVSTORE_BIN=build-asan/kvstore .venv/bin/python tests/chaos_crash_test.py --iterations 20 --fsync always
+scripts/bench.sh build/kvstore     # redis-benchmark, all three fsync modes
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--bind <address>` | `127.0.0.1` | Interface to listen on |
-| `--port <port>` | `6379` | TCP port; `0` picks a free one |
-| `--wal <path>` | `wal.log` | Write-ahead log file |
-| `--threads <n>` | `4` | I/O threads |
-| `--no-fsync` | off | Skip the per-write flush — faster, not crash-safe |
+| `--bind <addr>` | `127.0.0.1` | interface |
+| `--port <port>` | `6379` | `0` picks a free port |
+| `--wal <path>` | `wal.log` | write-ahead log |
+| `--fsync no\|group\|always` | `always` | durability policy (below) |
+| `--group-window-ms <n>` | `10` | group commit: max wait before fsync |
+| `--group-max-ops <n>` | `64` | group commit: max records per fsync |
 
-Talk to it with `redis-cli -p 6379`, or with anything at hand:
+Docker (the image build runs the sanitizer test suite, then ships the Release binary):
 
 ```bash
-printf 'SET user:1 ikbal\r\nGET user:1\r\nPING\r\n' | nc -w 2 127.0.0.1 6379
+docker compose up -d          # 127.0.0.1:6379, WAL on a named volume, --fsync always
 ```
 
 ## Commands
 
-| Command | Reply |
-|---|---|
-| `SET key value` | `+OK` |
-| `GET key` | bulk string, or `$-1` if absent or expired |
-| `DEL key [key ...]` | number removed |
-| `EXPIRE key seconds` | `:1` if the key existed, `:0` otherwise |
-| `PING [message]` | `+PONG`, or the message echoed |
-
-Both RESP arrays (`*3\r\n$3\r\nSET\r\n...`) and plain inline lines
-(`SET k v\n`) are accepted, so `redis-cli`, `nc`, and telnet all work.
+`PING [msg]`, `ECHO msg`, `SET key value [EX seconds | PX milliseconds]`,
+`GET key`, `DEL key [key ...]`, `EXPIRE key seconds`, `TTL key`, and `COMPACT`
+(rewrites the WAL down to the live keyspace). Both RESP arrays and inline
+commands are accepted.
 
 ## Durability
 
-Every mutation is encoded, written, and flushed to disk **before** it becomes
-visible in memory. Records are length-prefixed and CRC-32 checked, so a process
-killed mid-write leaves a torn final record that recovery detects, discards, and
-truncates away. Expiry deadlines are persisted as absolute timestamps, so keys
-that expire while the process is down do not come back.
+| Mode | `+OK` is sent after | Survives process crash | Survives power loss |
+|---|---|---|---|
+| `no` | `write(2)` | yes (page cache) | no |
+| `group` | one fsync covering ≤64 records or ≤10 ms | yes | yes |
+| `always` | an fsync of that record | yes | yes |
 
-```bash
-./build/kvstore --port 7391 --wal /tmp/demo.log &
-printf 'SET user:1 ikbal\r\n' | nc -w 2 127.0.0.1 7391
-kill -9 %1                     # hard crash
-./build/kvstore --port 7391 --wal /tmp/demo.log &
-printf 'GET user:1\r\n' | nc -w 2 127.0.0.1 7391    # -> ikbal
-```
+On macOS "fsync" means `fcntl(F_FULLFSYNC)`. Plain `fsync()` there does not
+flush the drive's write cache.
 
-## Terminal client
+WAL frame, little-endian: `[CRC32 4B][Op 1B][KeyLen 4B][ValLen 4B][ExpireAtMs 8B][Key][Val]`.
+The CRC covers everything after itself. Expiry is an absolute Unix-ms deadline.
 
-```bash
-./build/kvstore-cli                       # interactive prompt
-./build/kvstore-cli PING                  # one-shot, exits 0/1/2
-printf 'SET a 1\nGET a\n' | ./build/kvstore-cli
-```
+Recovery: a bad final frame (torn write, garbage or zeros) is `ftruncate()`d
+and the truncation is fsynced. A bad frame **followed by any valid frame** is
+mid-file corruption: the server exits with code 3 and leaves the file
+untouched rather than silently dropping acknowledged writes.
 
-Colour-coded output, quoted arguments (`SET k "hello world"`), and exit codes
-suitable for scripting: `0` success, `1` error reply, `2` connection failure.
-Colour is suppressed automatically when stdout is not a terminal, and when
-`NO_COLOR` is set.
+Compaction: write `wal.tmp` → fsync → `rename` → reopen → fsync the directory.
 
-## Python SDK
+## Verified results
 
-Standard library only — no `pip install`.
+All figures come from actual runs of the final code. The raw output is in
+[BENCHMARKS.md](BENCHMARKS.md). Host: Apple M2 Pro, 16 GiB, macOS 26.6.2,
+redis-benchmark 8.10.1 over loopback, 50 clients, 16 B values, random keys
+over 100k.
 
-```python
-import sys; sys.path.insert(0, "sdk")
-from redis_lite import Client
+| `--fsync` | SET ops/s | SET p50 / p99 | GET ops/s | GET p50 / p99 | SET ops/s `-P 16` |
+|---|---:|---:|---:|---:|---:|
+| `no` | 97,847.36 | 0.367 / 1.151 ms | 101,317.12 | 0.271 / 1.047 ms | 294,637.59 |
+| `group` | 3,346.94 | 14.127 / 27.199 ms | 82,767.76 | 0.311 / 1.343 ms | 15,893.20 |
+| `always` | 513.35 | 94.207 / 139.135 ms | 107,273.12 | 0.263 / 0.927 ms | 602.21 |
 
-with Client(host="127.0.0.1", port=6379) as client:
-    client.set("user:1", "ikbal")
-    client.get("user:1")            # 'ikbal'
-    client.expire("user:1", 60)     # True
-    client.delete("user:1")         # 1
-    client.ping()                   # 'PONG'
-```
+- One `F_FULLFSYNC` on this SSD has a p50 of 2000.8 µs, which caps `always` near
+  500 SET/s. Group commit keeps the same ack-after-fsync guarantee at 6.5×
+  that throughput, or 26.4× with `-P 16` pipelining.
+- Chaos: 20 SIGKILLs under `--fsync always` with 8 concurrent writers lost
+  **0 of 6,644** acknowledged writes (and 0 of 6,640 under
+  `group`). Garbage tails of 1–4096 bytes were truncated exactly. A mid-file
+  byte flip made the server refuse to start (exit 3), with the WAL unchanged.
+- `COMPACT` shrank a 53,000,000-byte log to 5,299,470 bytes
+  in 0.039 s end to end, and all 99,990 keys came back on
+  restart.
+- 44 C++ tests under `-Werror` + ASan/UBSan (macOS clang 21 and Linux GCC 12),
+  and 24 redis-py tests across the three modes, all passing.
 
-Binary-safe values, dictionary sugar (`client["k"] = "v"`), pipelining, and
-typed exceptions (`CommandError`, `ConnectionError`, `ProtocolError`). A client
-owns one socket and is not thread-safe — use one per thread.
+## Known limitations
 
-## Benchmark
-
-```bash
-python3 scripts/benchmark.py --ops 10000 --threads 8
-```
-
-```
-Workload          Ops   Time (s)        Req/s   p50 (ms)   p99 (ms)   max (ms)   Errors
----------------------------------------------------------------------------------------
-SET            10,000      0.393       25,438      0.286      0.787      2.049        0
-GET            10,000      0.382       26,157      0.278      0.777      2.386        0
-MIXED 1:1      10,000      0.386       25,894      0.276      0.810      2.537        0
-```
-
-That run is against a `--no-fsync` server. With the default per-write flush,
-SET drops to ~370 req/s while GET is essentially unchanged — the durability
-tax, and evidence that readers are not blocked by the disk. See `EXPLAINER.md`
-§6.3.
-
-## Docker
-
-```bash
-docker compose up -d          # build, start, publish 127.0.0.1:6379
-docker compose ps             # (healthy) once the PING check passes
-docker compose down           # stop, keeping the data volume
-docker compose down -v        # stop and delete the data
-```
-
-Multi-stage build: the compiler stage is discarded, leaving a ~136 MB runtime
-image that runs as a non-root user. The test suite runs during the image build,
-so a broken image fails to build. `wal.log` lives on a named volume, so data
-outlives the container.
-
-## Build options
-
-| Option | Default | Effect |
-|---|---|---|
-| `KVSTORE_WERROR` | `OFF` | Treat warnings as errors |
-| `KVSTORE_SANITIZE` | `OFF` | Build with ASan + UBSan |
-
-The project is warning-free under `-Wall -Wextra -pedantic -Werror` on both
-Clang and GCC; the container build enables `KVSTORE_WERROR` to keep it that way.
-
-## Layout
-
-```
-include/kvstore/
-  server.hpp      sockets, event loop, connection buffers
-  protocol.hpp    RESP parsing and reply encoding
-  storage.hpp     hash map, locking, expiry
-  wal.hpp         log record format, append, replay
-src/
-  main.cpp        argument parsing, startup, signal handling
-  server.cpp      + command dispatch
-  cli_main.cpp    kvstore-cli, standalone terminal client
-  protocol.cpp
-  storage.cpp
-  wal.cpp
-sdk/redis_lite.py       dependency-free Python client
-scripts/benchmark.py    throughput and latency harness
-tests/test_main.cpp
-Dockerfile              multi-stage build
-docker-compose.yml      port binding and persistent volume
-EXPLAINER.md            architecture and the OS mechanics underneath it
-```
-
-`EXPLAINER.md` is the long-form walkthrough: what a file descriptor and a TCP
-socket actually are, why network data arrives in arbitrary chunks, where a
-`write()` really lands before `fsync`, why readers should not block readers, and
-a line-by-line tour of the code with tracing exercises.
-
-## Limitations
-
-No log compaction, no authentication or TLS, no replication, string values only.
-`poll` is O(connections) per iteration. See the last section of `EXPLAINER.md`
-for the full list and what each would take to fix.
+- Under `group`, a write is visible to other clients before its fsync. The
+  writer is acknowledged only after the fsync. This matches Redis
+  `appendfsync everysec` semantics for readers.
+- `COMPACT` runs on the event loop and blocks it for O(live keys).
+- Replay reads the entire WAL into memory.
+- `poll(2)` is O(connections) per wakeup; epoll/kqueue would be O(ready).
+- No auth/TLS: bind to localhost or put it behind a proxy.

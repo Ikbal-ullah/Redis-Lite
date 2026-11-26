@@ -61,3 +61,11 @@ below were **not** covered by any test.
 4. Tests under `-Werror` + ASan/UBSan, Python chaos test (20× SIGKILL + torn
    tail), `redis-benchmark` for all three modes, Dockerfile + CI.
 5. Remove dead code/docs (B4, B5); add `OWNERSHIP_DRILL.md`, `BENCHMARKS.md`.
+
+## E. Found during hardening (in the new code, before merge)
+
+| # | Where | Bug | How it was found / fixed |
+|---|---|---|---|
+| E1 | `Server::handle` | A backpressure-paused connection was resumed only once per event. If that resume's `flush` drained the whole backlog, the connection was left with `input_paused` set and an empty `write_buf`: poll watched it for neither `POLLIN` nor `POLLOUT`, and the rest of the pipeline never ran. | Showed up as 60/64 replies in a stress run under CPU load. Fixed by `Server::pump` (loop process→flush). Made deterministic with a configurable `output_high_water`; the regression test fails 3/3 on the pre-fix server and passes on the fix. |
+| E2 | `Server::flush_released` | After E1, `pump()` could start a group commit that appends to `released_` while it is being iterated. | Code review of the E1 fix; the loop now swaps into a local batch. |
+| E3 | tests | GCC 12 `-Wrestrict` false positive (GCC bug 105329) on `"lit" + std::to_string(n)` at -O3 broke the `-Werror` Linux build. | Caught by the Docker build. Replaced with an append-based `testing::cat()` helper; warning not suppressed. |

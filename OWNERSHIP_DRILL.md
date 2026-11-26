@@ -27,8 +27,8 @@ prove it by rewriting the two core files from scratch.
                          │        │                                                │     │
                          │        │    reply → write_buf          (no / always)    │     │
                          │        │          → held_buf           (group, unsynced)│     │
-                         │        │    flush()       send ← write_buf; POLLOUT only│     │
-                         │        │                  while write_buf is non-empty  │     │
+                         │        │    pump()/flush() send ← write_buf; POLLOUT    │     │
+                         │        │                  only while write_buf non-empty│     │
                          │        └─ run_timers()                                  │     │
                          │             maybe_group_commit(): ≥64 recs or ≥10 ms ───┤     │
                          │               → Wal::sync() → held_buf ⇒ write_buf      │     │
@@ -136,14 +136,18 @@ drops anything already dead. One caveat: the wall clock can step backwards
 
 **Q9. A client pipelines 1 GB of GETs and never reads. What happens?**
 Replies pile up in `write_buf`. Once `Connection::backlog()` reaches
-`kOutputHighWater` (16 MiB), `Server::process` stops parsing (`input_paused`)
-and `run` stops requesting `POLLIN` for that fd. TCP flow control then pushes
-back on the client. When `flush` drains below the mark, `handle` resumes
-`process`. A request that is still incomplete past `kMaxQueryBuffer` (128 MiB)
-gets `-ERR` and the connection is closed. `POLLOUT` is requested only while
-`write_buf` is non-empty, because an idle socket is always writable and asking
-anyway would turn `poll` into a busy loop. Test:
-`slow_reader_gets_backpressure_not_unbounded_memory`.
+`ServerConfig::output_high_water` (16 MiB), `Server::process` stops parsing
+(`input_paused`) and `run` stops requesting `POLLIN` for that fd. TCP flow
+control then pushes back on the client. `Server::pump` loops process→flush while
+the connection is paused but the backlog has drained below the mark. That loop
+fixes a real stall found under load: if a single `flush` drained the whole
+backlog, the connection was left paused with nothing to send, so poll asked for
+neither `POLLIN` nor `POLLOUT` and it hung forever (deterministic regression
+test `fast_reader_resumes_after_backpressure_without_stalling`). A request still
+incomplete past `kMaxQueryBuffer` (128 MiB) gets `-ERR` and the connection is
+closed. `POLLOUT` is requested only while `write_buf` is non-empty, because an
+idle socket is always writable and asking anyway would turn `poll` into a busy
+loop.
 
 **Q10. How do you know there are no fd leaks, and what happens at the fd limit?**
 `Connection::~Connection` is the only place a client fd is closed, and
