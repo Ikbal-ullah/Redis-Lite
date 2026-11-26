@@ -88,6 +88,12 @@ ParseResult parse_array(std::string_view input, Command& out) {
     // but the bytes have not arrived. Report kIncomplete and consume nothing,
     // so the caller can call again unchanged after the next read().
     if (input.size() < need) return incomplete();
+    // The length says where the payload ends; the CRLF proves the sender
+    // agrees. Without this check a mis-framed client silently desynchronises
+    // the stream and every later command is parsed from the wrong offset.
+    if (input[need - 2] != '\r' || input[need - 1] != '\n') {
+      return failure("Protocol error: expected CRLF after bulk string");
+    }
 
     // Zero-copy. The argument is a view into the caller's buffer; no allocation
     // and no memcpy happens for the payload, however large it is.
