@@ -23,9 +23,6 @@ constexpr std::size_t kReadChunk = 64 * 1024;
 constexpr std::size_t kMaxReadPerEvent = 1024 * 1024;
 // A request still incomplete past this size is hostile or broken.
 constexpr std::size_t kMaxQueryBuffer = 128u * 1024u * 1024u;
-// Backpressure: stop parsing a client's input while this many reply bytes are
-// queued for it (it is pipelining faster than it reads).
-constexpr std::size_t kOutputHighWater = 16u * 1024u * 1024u;
 constexpr std::size_t kWriteCompactThreshold = 64 * 1024;
 
 #if defined(MSG_NOSIGNAL)
@@ -225,13 +222,19 @@ void Server::maybe_group_commit(bool force) {
 
 void Server::flush_released() {
   // Push released replies out now instead of waiting a poll() round trip.
-  for (int fd : released_) {
-    auto it = conns_.find(fd);
-    if (it == conns_.end()) continue;
-    Connection& conn = *it->second;
-    if (!flush(conn) || should_close(conn)) close_conn(fd);
+  // Swap first: pump() -> process() can trigger another group commit, which
+  // appends to released_ and would invalidate a live iterator over it.
+  while (!released_.empty()) {
+    std::vector<int> batch;
+    batch.swap(released_);
+    for (int fd : batch) {
+      auto it = conns_.find(fd);
+      if (it == conns_.end()) continue;
+      Connection& conn = *it->second;
+      // pump(), not just flush(): input may be paused behind the held replies.
+      if (!pump(conn) || should_close(conn)) close_conn(fd);
+    }
   }
-  released_.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -282,13 +285,20 @@ void Server::handle(Connection& conn, short revents) {
   if ((revents & (POLLIN | POLLHUP)) && !conn.peer_eof) {
     if (!read_ready(conn)) return close_conn(fd);
   }
-  process(conn);
-  if (!flush(conn)) return close_conn(fd);
-  if (conn.input_paused && conn.backlog() < kOutputHighWater) {
-    process(conn);  // backlog drained below the mark: resume parsing
-    if (!flush(conn)) return close_conn(fd);
-  }
-  if (should_close(conn)) close_conn(fd);
+  if (!pump(conn) || should_close(conn)) close_conn(fd);
+}
+
+bool Server::pump(Connection& conn) {
+  // Parse/execute, then send. If parsing paused on backpressure and the send
+  // drained the backlog below the mark, go again: otherwise a connection can
+  // be left with input_paused set and an empty write_buf, so poll() asks for
+  // neither POLLIN nor POLLOUT and the connection hangs forever. Terminates:
+  // every round either consumes input or leaves a backlog only POLLOUT clears.
+  do {
+    process(conn);
+    if (!flush(conn)) return false;
+  } while (conn.input_paused && conn.backlog() < config_.output_high_water);
+  return true;
 }
 
 bool Server::read_ready(Connection& conn) {
@@ -320,7 +330,7 @@ void Server::process(Connection& conn) {
   Command command;
 
   while (pos < conn.read_buf.size() && !conn.close_after_flush) {
-    if (conn.backlog() >= kOutputHighWater) {
+    if (conn.backlog() >= config_.output_high_water) {
       conn.input_paused = true;
       break;
     }

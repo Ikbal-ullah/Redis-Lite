@@ -52,6 +52,9 @@ struct ServerConfig {
   // Active expiry: every cycle evicts at most `expire_budget` dead keys.
   int expire_cycle_ms = 100;
   std::size_t expire_budget = 200;
+  // Backpressure: stop parsing a client's pipeline while this many reply bytes
+  // are queued for it.
+  std::size_t output_high_water = 16u * 1024u * 1024u;
 };
 
 class Connection {
@@ -101,6 +104,7 @@ class Server {
   void accept_ready();
   void handle(Connection& conn, short revents);
   bool read_ready(Connection& conn);
+  bool pump(Connection& conn);
   void process(Connection& conn);
   bool flush(Connection& conn);
   bool should_close(const Connection& conn) const noexcept;

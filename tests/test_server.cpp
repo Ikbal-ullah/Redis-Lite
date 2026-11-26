@@ -51,10 +51,12 @@ class Client {
     }
   }
   void shutdown_write() { ::shutdown(fd_, SHUT_WR); }
-  // Reads until `n` bytes arrived, EOF, or 5 s passed.
+  // Reads until `n` bytes arrived, EOF, or the server sent nothing for 5 s.
+  // An idle timeout, not a total one: a 64 MiB transfer under ASan on a loaded
+  // machine can legitimately take longer than 5 s, but a stalled server cannot.
   std::string recv_exact(std::size_t n) {
     std::string out;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (out.size() < n && std::chrono::steady_clock::now() < deadline) {
       pollfd p{fd_, POLLIN, 0};
       if (::poll(&p, 1, 100) <= 0) continue;
@@ -62,6 +64,7 @@ class Client {
       const ssize_t got = ::recv(fd_, buf, sizeof(buf), 0);
       if (got <= 0) break;
       out.append(buf, static_cast<std::size_t>(got));
+      deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     }
     return out;
   }
@@ -114,8 +117,8 @@ std::size_t open_fd_count() {
 }
 
 std::string resp(std::initializer_list<std::string> args) {
-  std::string out = "*" + std::to_string(args.size()) + "\r\n";
-  for (const auto& a : args) out += "$" + std::to_string(a.size()) + "\r\n" + a + "\r\n";
+  std::string out = testing::cat("*", args.size(), "\r\n");
+  for (const auto& a : args) out += testing::cat("$", a.size(), "\r\n", a, "\r\n");
   return out;
 }
 
@@ -149,12 +152,12 @@ TEST(server_answers_a_pipeline_sent_in_one_write) {
   Client c(srv.port());
   std::string batch, expected;
   for (int i = 0; i < 500; ++i) {
-    batch += resp({"SET", "p" + std::to_string(i), std::to_string(i)});
+    batch += resp({"SET", testing::cat("p", i), std::to_string(i)});
     expected += "+OK\r\n";
   }
   for (int i = 0; i < 500; ++i) {
-    batch += resp({"GET", "p" + std::to_string(i)});
-    expected += "$" + std::to_string(std::to_string(i).size()) + "\r\n" + std::to_string(i) + "\r\n";
+    batch += resp({"GET", testing::cat("p", i)});
+    expected += testing::cat("$", std::to_string(i).size(), "\r\n", i, "\r\n");
   }
   CHECK_EQ(c.roundtrip(batch, expected), expected);
 }
@@ -178,7 +181,7 @@ TEST(half_closed_client_still_gets_every_reply) {
   std::string expected;
   std::string batch;
   for (int i = 0; i < 50; ++i) {
-    batch += resp({"SET", "h" + std::to_string(i), "v"});
+    batch += resp({"SET", testing::cat("h", i), "v"});
     expected += "+OK\r\n";
   }
   c.send(batch);
@@ -251,7 +254,7 @@ TEST(group_commit_batches_fsyncs_and_still_acks_every_write) {
   Client c(srv.port());
   std::string batch, expected;
   for (int i = 0; i < 640; ++i) {
-    batch += resp({"SET", "g" + std::to_string(i), "v"});
+    batch += resp({"SET", testing::cat("g", i), "v"});
     expected += "+OK\r\n";
   }
   CHECK_EQ(c.roundtrip(batch, expected), expected);
@@ -281,7 +284,7 @@ TEST(many_concurrent_clients_are_served) {
   Running srv(path.str(), FsyncPolicy::kGroup);
   std::vector<std::unique_ptr<Client>> clients;
   for (int i = 0; i < 200; ++i) clients.push_back(std::make_unique<Client>(srv.port()));
-  for (std::size_t i = 0; i < clients.size(); ++i) clients[i]->send(resp({"SET", "c" + std::to_string(i), "v"}));
+  for (std::size_t i = 0; i < clients.size(); ++i) clients[i]->send(resp({"SET", testing::cat("c", i), "v"}));
   for (auto& cl : clients) CHECK_EQ(cl->recv_exact(5), std::string("+OK\r\n"));
 }
 
@@ -296,8 +299,33 @@ TEST(slow_reader_gets_backpressure_not_unbounded_memory) {
   for (int i = 0; i < 64; ++i) batch += resp({"GET", "big"});
   c.send(batch);
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
-  const std::string one = "$" + std::to_string(big.size()) + "\r\n" + big + "\r\n";
+  const std::string one = testing::cat("$", big.size(), "\r\n", big, "\r\n");
   const std::string got = c.recv_exact(one.size() * 64);
   CHECK_EQ(got.size(), one.size() * 64);
   CHECK(got.compare(0, one.size(), one) == 0);
+}
+
+TEST(fast_reader_resumes_after_backpressure_without_stalling) {
+  // Regression: when one flush drained the whole high-water backlog, the
+  // connection was left paused with nothing to send, so poll() watched it for
+  // neither POLLIN nor POLLOUT and the remaining pipelined commands never ran.
+  // A 4 KiB mark with 1 KiB replies makes "one flush drains everything" the
+  // common case, so this reproduces deterministically.
+  TempPath path;
+  ServerConfig config;
+  config.output_high_water = 4096;
+  Running srv(path.str(), FsyncPolicy::kNo, config);
+  Client c(srv.port());
+  const std::string big(1024, 'y');
+  c.roundtrip(resp({"SET", "big", big}), "+OK\r\n");
+  const std::string one = testing::cat("$", big.size(), "\r\n", big, "\r\n");
+  std::string batch;
+  for (int i = 0; i < 40; ++i) batch += resp({"GET", "big"});
+  batch += "PING\r\n";
+  for (int round = 0; round < 5; ++round) {
+    c.send(batch);  // then read immediately and as fast as possible
+    const std::string got = c.recv_exact(one.size() * 40 + 7);
+    CHECK_EQ(got.size(), one.size() * 40 + 7);
+    CHECK(got.compare(got.size() - 7, 7, "+PONG\r\n") == 0);
+  }
 }
