@@ -27,14 +27,14 @@ services:
       - "6379"
       - "--wal"
       - "/data/wal.log"
-      - "--threads"
-      - "4"
+      - "--fsync"
+      - "always"
 
     restart: unless-stopped
 
-    # The server flushes each write before acknowledging it, so a stop is never
-    # data-loss. The grace period is here so in-flight requests finish rather
-    # than seeing a reset connection.
+    # Under --fsync always|group no write is acknowledged before it is fsynced,
+    # and SIGTERM syncs the WAL on the way out. The grace period lets in-flight
+    # requests finish rather than seeing a reset connection.
     stop_grace_period: 10s
 
     healthcheck:
@@ -45,7 +45,7 @@ services:
       start_period: 5s
 
     ulimits:
-      # One descriptor per connection, plus the log and the wakeup pipes. The
+      # One descriptor per connection, plus the log and the wakeup pipe. The
       # default of 1024 caps concurrent clients well below what the server can
       # actually handle.
       nofile:

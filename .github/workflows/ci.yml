@@ -1,0 +1,70 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install redis tools
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y redis-tools
+          else brew install redis; fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install redis pytest
+
+      # -Wall -Wextra -Werror (KVSTORE_WERROR defaults ON) + ASan/UBSan, with
+      # UBSan findings fatal.
+      - name: Build (sanitizers)
+        run: |
+          cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DKVSTORE_SANITIZE=ON
+          cmake --build build-asan --parallel
+
+      - name: Unit + socket tests
+        run: ctest --test-dir build-asan --output-on-failure
+
+      - name: redis-py compatibility
+        env:
+          KVSTORE_BIN: build-asan/kvstore
+        run: python -m pytest -q tests/test_redis_py.py
+
+      - name: Chaos (20x SIGKILL, torn tail, mid-file corruption)
+        env:
+          KVSTORE_BIN: build-asan/kvstore
+        run: |
+          python tests/chaos_crash_test.py --iterations 20 --fsync always
+          python tests/chaos_crash_test.py --iterations 5 --fsync group
+
+      - name: Release build + redis-benchmark smoke
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+          ./build/kvstore --port 7700 --wal smoke.wal --fsync group &
+          sleep 1
+          redis-benchmark -p 7700 -n 20000 -c 50 -t set,get -q
+          kill %1
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image (runs the sanitizer test suite inside)
+        run: docker build -t kvstore:ci .
+      - name: Smoke test the container
+        run: |
+          docker run -d --name kv -p 127.0.0.1:6379:6379 kvstore:ci
+          sleep 2
+          docker exec kv kvstore-cli --host 127.0.0.1 --port 6379 SET k v
+          docker exec kv kvstore-cli --host 127.0.0.1 --port 6379 GET k
+          docker logs kv

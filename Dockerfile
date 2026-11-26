@@ -25,14 +25,15 @@ COPY include ./include
 COPY src ./src
 COPY tests ./tests
 
-# -DKVSTORE_WERROR=ON so a warning fails the image build rather than shipping.
-# The test suite runs here too: an image that cannot pass its own tests should
-# never reach a registry.
-RUN cmake -S . -B build \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DKVSTORE_WERROR=ON \
+# Two builds. The first is ASan+UBSan and only exists to run the test suite:
+# an image whose code trips a sanitizer must never reach a registry. The second
+# is the optimised binary that ships. Warnings are errors in both (the CMake
+# default).
+RUN cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DKVSTORE_SANITIZE=ON \
+ && cmake --build build-asan --parallel "$(nproc)" \
+ && ctest --test-dir build-asan --output-on-failure \
+ && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
  && cmake --build build --parallel "$(nproc)" \
- && ctest --test-dir build --output-on-failure \
  && cmake --install build --prefix /opt/kvstore
 
 # ---------------------------------------------------------------------------
@@ -70,7 +71,7 @@ EXPOSE 6379
 # here precisely because the container's network namespace is the boundary --
 # publish the port narrowly on the host side (see docker-compose.yml).
 ENTRYPOINT ["kvstore"]
-CMD ["--bind", "0.0.0.0", "--port", "6379", "--wal", "/data/wal.log"]
+CMD ["--bind", "0.0.0.0", "--port", "6379", "--wal", "/data/wal.log", "--fsync", "always"]
 
 # Exec form so the server is PID 1 and receives SIGTERM directly from
 # `docker stop`, letting it shut down through its own signal handler.
