@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(kvstore
         VERSION 1.0.0
-        DESCRIPTION "A durable key-value store with a write-ahead log and a non-blocking TCP front end"
+        DESCRIPTION "A Redis-compatible key-value store: single-threaded poll(2) loop, RESP2, CRC-framed WAL"
         LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -15,7 +15,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
 
-option(KVSTORE_WERROR "Treat compiler warnings as errors" OFF)
+option(KVSTORE_WERROR "Treat compiler warnings as errors" ON)
 option(KVSTORE_SANITIZE "Build with the address and undefined-behaviour sanitizers" OFF)
 
 add_library(kvstore_warnings INTERFACE)
@@ -34,10 +34,13 @@ endif()
 
 add_library(kvstore_sanitizers INTERFACE)
 if(KVSTORE_SANITIZE)
-  # ASan catches use-after-free on the buffers; TSan (built separately) is the
-  # tool for the locking. They cannot be combined in one binary.
-  target_compile_options(kvstore_sanitizers INTERFACE -fsanitize=address,undefined -fno-omit-frame-pointer)
-  target_link_options(kvstore_sanitizers INTERFACE -fsanitize=address,undefined)
+  # ASan: use-after-free / overflow on the connection buffers and the
+  # string_view-keyed expiry index. UBSan: signed overflow in deadline math.
+  # -fno-sanitize-recover: a UBSan finding aborts the process (and fails the
+  # test) instead of printing a line nobody reads.
+  target_compile_options(kvstore_sanitizers INTERFACE
+    -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer)
+  target_link_options(kvstore_sanitizers INTERFACE -fsanitize=address,undefined -fno-sanitize-recover=all)
 endif()
 
 # Everything except main() lives in a library so the tests can link the real
@@ -45,16 +48,15 @@ endif()
 add_library(kvstore_core STATIC
   src/protocol.cpp
   src/storage.cpp
+  src/database.cpp
   src/wal.cpp
   src/server.cpp)
 
 target_include_directories(kvstore_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 
-find_package(Threads REQUIRED)
-target_link_libraries(kvstore_core
-  PUBLIC Threads::Threads
-  PRIVATE kvstore_warnings kvstore_sanitizers)
+# The server is single-threaded: the core library links no thread library.
+target_link_libraries(kvstore_core PRIVATE kvstore_warnings kvstore_sanitizers)
 
 add_executable(kvstore src/main.cpp)
 target_link_libraries(kvstore PRIVATE kvstore_core kvstore_warnings kvstore_sanitizers)
@@ -70,10 +72,17 @@ install(TARGETS kvstore kvstore-cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 enable_testing()
 
-add_executable(kvstore_tests tests/test_main.cpp)
-target_link_libraries(kvstore_tests PRIVATE kvstore_core kvstore_warnings kvstore_sanitizers)
+# The tests (not the server) use a thread to drive the server from a client.
+find_package(Threads REQUIRED)
+add_executable(kvstore_tests
+  tests/test_main.cpp
+  tests/test_protocol.cpp
+  tests/test_storage.cpp
+  tests/test_wal.cpp
+  tests/test_server.cpp)
+target_include_directories(kvstore_tests PRIVATE tests)
+target_link_libraries(kvstore_tests PRIVATE kvstore_core kvstore_warnings kvstore_sanitizers Threads::Threads)
 
 add_test(NAME kvstore_tests COMMAND kvstore_tests)
-# The concurrency and recovery cases sleep on real clocks; give them headroom
-# on a loaded machine without letting a genuine hang run forever.
+# Server cases use real sockets and clocks; bound a genuine hang.
 set_tests_properties(kvstore_tests PROPERTIES TIMEOUT 120)

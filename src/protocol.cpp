@@ -10,15 +10,20 @@ namespace {
 
 constexpr std::string_view kCrlf = "\r\n";
 
+// ASCII-only on purpose: std::tolower consults the C locale.
+char lower(char c) noexcept { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c; }
+
+}  // namespace
+
 bool iequals(std::string_view a, std::string_view b) noexcept {
   if (a.size() != b.size()) return false;
   for (std::size_t i = 0; i < a.size(); ++i) {
-    const auto ca = static_cast<unsigned char>(a[i]);
-    const auto cb = static_cast<unsigned char>(b[i]);
-    if (std::tolower(ca) != std::tolower(cb)) return false;
+    if (lower(a[i]) != lower(b[i])) return false;
   }
   return true;
 }
+
+namespace {
 
 // Strict signed decimal. Rejects "12abc", "", "+3", and anything that would
 // overflow -- std::from_chars reports all of it without ever throwing.
@@ -149,10 +154,13 @@ ParseResult parse_inline(std::string_view input, Command& out) {
 
 CommandKind classify(std::string_view name) noexcept {
   if (iequals(name, "PING")) return CommandKind::kPing;
+  if (iequals(name, "ECHO")) return CommandKind::kEcho;
   if (iequals(name, "SET")) return CommandKind::kSet;
   if (iequals(name, "GET")) return CommandKind::kGet;
   if (iequals(name, "DEL")) return CommandKind::kDel;
   if (iequals(name, "EXPIRE")) return CommandKind::kExpire;
+  if (iequals(name, "TTL")) return CommandKind::kTtl;
+  if (iequals(name, "COMPACT")) return CommandKind::kCompact;
   if (iequals(name, "COMMAND")) return CommandKind::kCommand;
   return CommandKind::kUnknown;
 }

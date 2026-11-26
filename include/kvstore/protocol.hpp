@@ -30,9 +30,8 @@
 //     A Command is valid only until the underlying buffer is appended to,
 //     compacted, or destroyed.
 //
-// The server satisfies this by draining the socket completely first, then
-// parsing and executing from the now-frozen buffer, and only afterwards
-// reading again.
+// The server satisfies this by reading first, then parsing and executing from
+// the now-frozen buffer, and only compacting it after the whole batch is done.
 
 #ifndef KVSTORE_PROTOCOL_HPP
 #define KVSTORE_PROTOCOL_HPP
@@ -56,10 +55,13 @@ inline constexpr std::size_t kMaxInlineLength = 64u * 1024u;        // 64 KiB
 enum class CommandKind {
   kEmpty,  // a blank inline line; consume it and say nothing
   kPing,
+  kEcho,     // redis-cli --pipe uses ECHO as its end-of-stream sentinel
   kSet,
   kGet,
   kDel,
   kExpire,
+  kTtl,
+  kCompact,  // rewrite the WAL down to the live keyspace
   kCommand,  // redis-cli sends COMMAND DOCS on connect
   kUnknown,
 };
@@ -87,6 +89,9 @@ struct ParseResult {
 // Attempts to parse exactly one command from the front of `input`.
 // On kOk, `out` is overwritten and `consumed` bytes may be retired.
 ParseResult parse_command(std::string_view input, Command& out);
+
+// ASCII case-insensitive comparison.
+bool iequals(std::string_view a, std::string_view b) noexcept;
 
 // Maps a command name to its kind, case-insensitively ("get", "GET", "GeT").
 CommandKind classify(std::string_view name) noexcept;

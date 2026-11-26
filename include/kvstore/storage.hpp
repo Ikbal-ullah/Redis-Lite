@@ -1,21 +1,18 @@
-// The storage engine: a hash map, a readers-writer lock, and a write-ahead log.
+// In-memory keyspace: a hash map plus an ordered index of expiry deadlines.
 //
-// Threading model
-// ---------------
-// Readers (get, size) take a shared lock: any number of them run at once.
-// Mutators (set, del, expire) take an exclusive lock: one at a time, and never
-// alongside a reader.
+// Single-threaded by design. The whole server runs on one event-loop thread,
+// so there are no locks here at all; the class is a plain data structure that
+// knows nothing about the WAL or the network. Time is always passed in, which
+// makes every expiry rule unit-testable without sleeping.
 //
-// Mutators additionally take `wal_mutex_` *before* the map lock, and hold it
-// across both the log append and the map update. That is what makes the log
-// order and the memory order identical -- without it, two threads could append
-// A-then-B to the log but apply B-then-A to the map, and a replay after a crash
-// would rebuild a state the server never actually served.
+// Expiry has two halves, as in Redis:
+//   lazy    every read checks the deadline and erases a dead key on the spot;
+//   active  active_expire() pops at most `budget` dead keys from the front of
+//           the deadline index. The cost is bounded by the budget and by the
+//           number of keys that are actually dead -- never O(keyspace).
 //
-// The lock order is always wal_mutex_ -> mutex_, never the reverse, so there is
-// no cycle and no deadlock. Note that the expensive part (the fsync) happens
-// while holding wal_mutex_ but *not* the map lock, so readers are never blocked
-// on a disk round-trip.
+// Neither kind of eviction is written to the WAL: replay re-checks every
+// absolute deadline against the clock, so a dead key is dropped there too.
 
 #ifndef KVSTORE_STORAGE_HPP
 #define KVSTORE_STORAGE_HPP
@@ -23,32 +20,24 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <mutex>
-#include <optional>
-#include <shared_mutex>
+#include <functional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
-
-#include "kvstore/wal.hpp"
+#include <utility>
 
 namespace kvstore {
 
-// Milliseconds since the Unix epoch.
-//
-// Deliberately the *wall* clock, not steady_clock. Expiry deadlines are written
-// to disk and must still mean something after a reboot; steady_clock's origin
-// is unspecified and typically resets with the machine, so a persisted
-// steady_clock deadline is meaningless on the next boot.
+// Milliseconds since the Unix epoch. Wall clock on purpose: deadlines are
+// persisted, and a steady_clock origin means nothing after a reboot.
 inline std::int64_t now_ms() {
   using namespace std::chrono;
   return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
-// Transparent hasher. Its `is_transparent` typedef unlocks heterogeneous
-// lookup, letting find() accept a std::string_view directly instead of forcing
-// every GET to construct (and heap-allocate) a temporary std::string just to
-// probe the table.
+// Enables heterogeneous lookup: find(std::string_view) without allocating a
+// temporary std::string on every GET.
 struct StringHash {
   using is_transparent = void;
   std::size_t operator()(std::string_view key) const noexcept {
@@ -58,73 +47,54 @@ struct StringHash {
 
 class Storage {
  public:
-  // `wal` may be null, in which case the store is purely in-memory. The Wal
-  // must outlive the Storage; ownership stays with the caller.
-  explicit Storage(Wal* wal = nullptr) noexcept : wal_(wal) {}
+  // Value of a live key, or nullptr. The pointer is valid until the next
+  // mutation; the caller encodes the reply immediately, so GET copies nothing.
+  const std::string* get(std::string_view key, std::int64_t now);
 
-  Storage(const Storage&) = delete;
-  Storage& operator=(const Storage&) = delete;
+  bool contains(std::string_view key, std::int64_t now) { return get(key, now) != nullptr; }
 
-  // Rebuilds in-memory state from the log. Applies records without re-logging
-  // them, then drops anything whose deadline has already passed. Call once, on
-  // an empty store, before serving traffic.
-  std::size_t load_from_wal();
+  // Inserts or overwrites. expire_at_ms == 0 means no expiry (and clears any
+  // previous one, as a plain SET does in Redis).
+  void set(std::string_view key, std::string_view value, std::int64_t expire_at_ms);
 
-  // Sets key to value and clears any existing TTL (this matches Redis: a plain
-  // SET makes the key persistent again).
-  void set(std::string_view key, std::string_view value);
+  // Removes the key if present (expired or not). Returns whether it existed.
+  bool erase(std::string_view key);
 
-  // Returns the value, or nullopt if absent or expired.
-  //
-  // Returns by value, not string_view: the view would dangle the moment the
-  // shared lock is released and another thread overwrote the entry. This is the
-  // exact opposite of the parser's situation, where zero-copy views are safe
-  // because the buffer provably outlives them.
-  std::optional<std::string> get(std::string_view key) const;
+  // Sets a new absolute deadline on an existing key. Returns false if absent.
+  bool set_expire(std::string_view key, std::int64_t expire_at_ms);
 
-  // Returns true if the key existed (and was not already expired).
-  bool del(std::string_view key);
+  // Redis TTL semantics, in milliseconds: -2 absent, -1 no expiry.
+  std::int64_t ttl_ms(std::string_view key, std::int64_t now);
 
-  // Sets an absolute deadline `ttl_seconds` from now. A non-positive TTL
-  // deletes the key immediately. Returns false if the key does not exist.
-  bool expire(std::string_view key, std::int64_t ttl_seconds);
+  // Evicts up to `budget` keys whose deadline is <= now. Returns how many.
+  std::size_t active_expire(std::int64_t now, std::size_t budget);
 
-  // Number of live (non-expired) keys.
-  std::size_t size() const;
+  // Keys currently held, including expired ones not yet evicted.
+  std::size_t size() const noexcept { return map_.size(); }
+  std::size_t volatile_keys() const noexcept { return deadlines_.size(); }
 
-  // Evicts every entry whose deadline has passed. Called periodically by the
-  // server's maintenance thread; without it, a key that is written with a TTL
-  // and never read again would occupy memory forever, since the read path only
-  // expires keys lazily.
-  //
-  // Evictions are deliberately *not* logged: replay re-checks every deadline
-  // against the current clock, so an expired record is dropped there anyway.
-  std::size_t purge_expired();
+  // Visits every live entry (used by WAL compaction).
+  void for_each_live(std::int64_t now,
+                     const std::function<void(std::string_view key, std::string_view value,
+                                              std::int64_t expire_at_ms)>& visit) const;
 
  private:
   struct Entry {
     std::string value;
-    std::int64_t expire_at_ms = 0;  // 0 == never expires
-
-    bool expired(std::int64_t now) const noexcept {
-      return expire_at_ms != 0 && expire_at_ms <= now;
-    }
+    std::int64_t expire_at_ms = 0;  // 0 == persistent
   };
-
   using Map = std::unordered_map<std::string, Entry, StringHash, std::equal_to<>>;
 
-  // Applies a decoded record to the map. Caller must hold mutex_ exclusively.
-  void apply_locked(const WalRecord& record);
+  // (deadline, key). The key is a view of the map node's own key string:
+  // unordered_map is node-based, so element addresses survive rehashing and
+  // the view stays valid until that node is erased. No key is stored twice.
+  using DeadlineIndex = std::set<std::pair<std::int64_t, std::string_view>>;
 
-  Wal* wal_;
+  void erase_it(Map::iterator it);
+  void reindex(Map::iterator it, std::int64_t new_expire_at_ms);
 
-  // Serializes mutators against each other and pins log order to memory order.
-  // Always acquired before mutex_.
-  std::mutex wal_mutex_;
-
-  // `mutable` so the const read path can lock it.
-  mutable std::shared_mutex mutex_;
   Map map_;
+  DeadlineIndex deadlines_;
 };
 
 }  // namespace kvstore
