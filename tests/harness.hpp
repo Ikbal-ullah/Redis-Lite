@@ -10,6 +10,8 @@
 #include <filesystem>
 #include <sstream>
 #include <string>
+#include <string_view>
+#include <type_traits>
 #include <unistd.h>
 #include <vector>
 
@@ -81,6 +83,21 @@ inline std::string show(bool v) { return v ? "true" : "false"; }
   } while (false)
 
 namespace testing {
+
+// Builds a string by appending pieces. Used instead of `"lit" + std::to_string(n)`
+// because GCC 12 at -O2/-O3 emits a false-positive -Wrestrict for that idiom
+// (GCC bug 105329), and warnings are errors here.
+inline void cat_one(std::string& s, std::string_view v) { s.append(v); }
+template <typename T, typename = std::enable_if_t<std::is_integral_v<T>>>
+void cat_one(std::string& s, T v) {
+  s.append(std::to_string(v));
+}
+template <typename... A>
+std::string cat(const A&... pieces) {
+  std::string s;
+  (cat_one(s, pieces), ...);
+  return s;
+}
 
 // A WAL path in the temp dir, removed (with its .tmp sibling) on scope exit.
 class TempPath {

@@ -41,7 +41,7 @@ std::vector<std::size_t> write_records(const std::string& path, int n) {
   std::vector<std::size_t> starts;
   for (int i = 0; i < n; ++i) {
     starts.push_back(wal.size_bytes());
-    wal.append(WalOp::kSet, "k" + std::to_string(i), "value-" + std::to_string(i), 0);
+    wal.append(WalOp::kSet, testing::cat("k", i), testing::cat("value-", i), 0);
   }
   return starts;
 }

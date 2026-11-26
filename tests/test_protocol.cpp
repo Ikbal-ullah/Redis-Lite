@@ -48,7 +48,7 @@ TEST(every_proper_prefix_is_incomplete) {
 
 TEST(pipelined_commands_in_one_buffer_parse_in_order) {
   std::string in;
-  for (int i = 0; i < 100; ++i) in += "*2\r\n$3\r\nGET\r\n$" + std::to_string(std::to_string(i).size()) + "\r\n" + std::to_string(i) + "\r\n";
+  for (int i = 0; i < 100; ++i) in += testing::cat("*2\r\n$3\r\nGET\r\n$", std::to_string(i).size(), "\r\n", i, "\r\n");
   in += "PING\r\n";
   std::string_view rest = in;
   for (int i = 0; i < 100; ++i) {
@@ -81,7 +81,7 @@ TEST(bulk_string_without_trailing_crlf_is_rejected) {
 
 TEST(binary_values_are_preserved) {
   const std::string value("a\r\nb\0c", 6);
-  const std::string in = "*2\r\n$4\r\nECHO\r\n$6\r\n" + value + "\r\n";
+  const std::string in = testing::cat("*2\r\n$4\r\nECHO\r\n$6\r\n", value, "\r\n");
   Command c;
   CHECK(parse_command(in, c).status == ParseStatus::kOk);
   CHECK_EQ(std::string(c.args[1]), value);

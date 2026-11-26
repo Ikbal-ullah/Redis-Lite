@@ -51,7 +51,7 @@ TEST(plain_set_clears_ttl_and_index) {
 
 TEST(active_expiry_is_bounded_by_budget) {
   Storage s;
-  for (int i = 0; i < 1000; ++i) s.set("k" + std::to_string(i), "v", 100 + i);
+  for (int i = 0; i < 1000; ++i) s.set(testing::cat("k", i), "v", 100 + i);
   s.set("forever", "v", 0);
   CHECK_EQ(s.active_expire(50, 200), 0u);      // nothing due yet
   CHECK_EQ(s.active_expire(10000, 200), 200u);  // capped at the budget
@@ -64,7 +64,7 @@ TEST(active_expiry_is_bounded_by_budget) {
 TEST(active_expiry_survives_rehashing) {
   // The index stores views into map nodes; rehashing must not invalidate them.
   Storage s;
-  for (int i = 0; i < 50000; ++i) s.set("key:" + std::to_string(i), "v", i % 2 ? 10 : 0);
+  for (int i = 0; i < 50000; ++i) s.set(testing::cat("key:", i), "v", i % 2 ? 10 : 0);
   CHECK_EQ(s.active_expire(11, 1000000), 25000u);
   CHECK_EQ(s.size(), 25000u);
 }
