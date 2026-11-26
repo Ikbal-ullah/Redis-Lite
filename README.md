@@ -47,7 +47,7 @@ scripts/bench.sh build/kvstore     # redis-benchmark, all three fsync modes
 | `--group-window-ms <n>` | `10` | group commit: max wait before fsync |
 | `--group-max-ops <n>` | `64` | group commit: max records per fsync |
 
-Docker (the image build runs the sanitizer test suite, then ships the Release binary):
+Docker (the image build runs the Release test suite; ASan/UBSan runs in native Linux/macOS CI):
 
 ```bash
 docker compose up -d          # 127.0.0.1:6379, WAL on a named volume, --fsync always

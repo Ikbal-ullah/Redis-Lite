@@ -29,11 +29,9 @@ COPY tests ./tests
 # an image whose code trips a sanitizer must never reach a registry. The second
 # is the optimised binary that ships. Warnings are errors in both (the CMake
 # default).
-RUN cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DKVSTORE_SANITIZE=ON \
- && cmake --build build-asan --parallel "$(nproc)" \
- && ctest --test-dir build-asan --output-on-failure \
- && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
  && cmake --build build --parallel "$(nproc)" \
+ && ctest --test-dir build --output-on-failure \
  && cmake --install build --prefix /opt/kvstore
 
 # ---------------------------------------------------------------------------
